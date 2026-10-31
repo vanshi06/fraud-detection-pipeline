@@ -1,45 +1,108 @@
-Overview
-========
+# Fraud Detection Pipeline
 
-Welcome to Astronomer! This project was generated after you ran 'astro dev init' using the Astronomer CLI. This readme describes the contents of the project, as well as how to run Apache Airflow on your local machine.
+An end-to-end batch data pipeline that takes messy credit card transaction data, cleans and validates it, loads it into Snowflake, models it with dbt, and scores every transaction for fraud risk. Orchestrated with Apache Airflow.
 
-Project Contents
-================
+## Architecture
 
-Your Astro project contains the following files and folders:
+```
+fraudTrain.csv (Kaggle)
+        |
+        v
+generate_messy_transactions   -> samples 10,000 rows, injects realistic data problems
+        |
+        v
+clean_transactions            -> dedupe, fix amounts/dates/names, flag outliers, quarantine bad rows
+        |
+        v
+validate                      -> row count, unique IDs, null checks (fails the run if broken)
+        |
+        v
+upload_to_snowflake_stage     -> PUT to internal stage
+        |
+        v
+load_raw                      -> COPY INTO RAW.TRANSACTIONS
+        |
+        v
+dbt_staging -> dbt_core -> dbt_test
+        |
+        v
+Snowflake Dynamic Table (CUSTOMER_ROLLING_STATS)
+        |
+        v
+Snowpark fraud scoring (REPORTING.FRAUD_SCORES)
+        |
+        v
+REPORTING.FRAUD_SUMMARY view
+```
 
-- dags: This folder contains the Python files for your Airflow DAGs. By default, this directory includes one example DAG:
-    - `example_astronauts`: This DAG shows a simple ETL pipeline example that queries the list of astronauts currently in space from the Open Notify API and prints a statement for each astronaut. The DAG uses the TaskFlow API to define tasks in Python, and dynamic task mapping to dynamically print a statement for each astronaut. For more on how this DAG works, see our [Getting started tutorial](https://www.astronomer.io/docs/learn/get-started-with-airflow).
-- Dockerfile: This file contains a versioned Astro Runtime Docker image that provides a differentiated Airflow experience. If you want to execute other commands or overrides at runtime, specify them here.
-- include: This folder contains any additional files that you want to include as part of your project. It is empty by default.
-- packages.txt: Install OS-level packages needed for your project by adding them to this file. It is empty by default.
-- requirements.txt: Install Python packages needed for your project by adding them to this file. It is empty by default.
-- plugins: Add custom or community plugins for your project to this file. It is empty by default.
-- airflow_settings.yaml: Use this local-only file to specify Airflow Connections, Variables, and Pools instead of entering them in the Airflow UI as you develop DAGs in this project.
+## Tech stack
 
-Deploy Your Project Locally
-===========================
+Apache Airflow 3 (Astro CLI, Docker), Python / pandas, Snowflake (internal stage, Dynamic Tables, Snowpark), dbt (Snowflake adapter), Git / GitHub.
 
-Start Airflow on your local machine by running 'astro dev start'.
+## Pipeline results
 
-This command will spin up five Docker containers on your machine, each for a different Airflow component:
+| Stage | Rows |
+|---|---|
+| Messy input (10,000 sampled + 200 injected duplicates) | 10,200 |
+| Clean (loaded to `RAW.TRANSACTIONS`) | 9,127 |
+| Quarantined (missing amount, customer or date) | 873 |
 
-- Postgres: Airflow's Metadata Database
-- Scheduler: The Airflow component responsible for monitoring and triggering tasks
-- DAG Processor: The Airflow component responsible for parsing DAGs
-- API Server: The Airflow component responsible for serving the Airflow UI and API
-- Triggerer: The Airflow component responsible for triggering deferred tasks
+Fraud risk scores on the clean data: **8,502** transactions scored 0, **620** scored 1, **5** scored 2.
 
-When all five containers are ready the command will open the browser to the Airflow UI at http://localhost:8080/. You should also be able to access your Postgres Database at 'localhost:5432/postgres' with username 'postgres' and password 'postgres'.
+## Screenshots
 
-Note: If you already have either of the above ports allocated, you can either [stop your existing Docker containers or change the port](https://www.astronomer.io/docs/astro/cli/troubleshoot-locally#ports-are-not-available-for-my-local-airflow-webserver).
+**Airflow DAG graph**
 
-Deploy Your Project to Astronomer
-=================================
+![Airflow graph](docs/images/airflow_graph.png)
 
-If you have an Astronomer account, pushing code to a Deployment on Astronomer is simple. For deploying instructions, refer to Astronomer documentation: https://www.astronomer.io/docs/astro/deploy-code/
+**Successful run, all tasks green**
 
-Contact
-=======
+![Airflow run](docs/images/airflow_run_success.png)
 
-The Astronomer CLI is maintained with love by the Astronomer team. To report a bug or suggest a change, reach out to our support.
+**dbt lineage**
+
+![dbt lineage](docs/images/dbt_lineage.png)
+
+## Data quality handling
+
+The generator deliberately injects: nulls, duplicate transaction IDs, mixed date formats, mixed currency formats (`$`, commas, `EUR`), extreme amount outliers and merchant name typos. The cleaning step fixes what it can and moves unrecoverable rows to a quarantine file instead of silently dropping them. Row counts are reconciled at the end (clean + quarantine + duplicates removed = input).
+
+## Fraud scoring
+
+A transaction gets one point for each rule it breaks:
+
+1. **Distance rule:** the merchant is more than 120 km from the customer (Haversine distance).
+2. **Spend rule:** the amount is more than 5x the customer's average spend (from the Dynamic Table).
+
+Score range is 0 to 2. Thresholds are constants at the top of the scoring code and are easy to tune.
+
+## Design decisions
+
+- **Internal stage vs S3:** an internal Snowflake stage keeps the project self-contained with no cloud storage setup. In production I would use S3 with a storage integration.
+- **Batch vs streaming:** the pipeline runs as scheduled batches. The Dynamic Table with a 5 minute target lag gives near-real-time aggregates without a streaming system.
+- **IQR vs z-score for outliers:** transaction amounts are heavily right-skewed, so IQR is more robust than a z-score. Outliers are flagged, not deleted, since a very large amount can itself be a fraud signal.
+- **Quarantine instead of deleting:** rows missing a required field are kept in a separate table so they can be inspected and reprocessed.
+- **Customer baseline over all history:** the dataset covers 2019 to 2020, so a "last 24 hours from now" window would be empty. The Dynamic Table uses each customer's full history as the baseline.
+- **Idempotent load:** `load_raw` truncates before `COPY INTO`, so re-running the DAG does not create duplicates.
+- **Rule-based scoring:** simple, explainable rules were chosen over a model. Each flag can be traced to a specific reason.
+- **dbt in an isolated virtualenv:** dbt is installed in its own `dbt_venv` inside the Airflow image to avoid dependency conflicts.
+
+## How to run it
+
+1. Install Docker Desktop and the Astro CLI.
+2. Download `fraudTrain.csv` from the Kaggle dataset "Credit Card Transactions Fraud Detection" and place it in `include/RAW/`. CSVs are not committed (see `.gitignore`).
+3. In Snowflake, create the database, schemas (`RAW`, `STAGING`, `CORE`, `REPORTING`), the stage `RAW.TRANSACTIONS_STAGE`, and the tables `RAW.TRANSACTIONS` and `RAW.TRANSACTIONS_QUARANTINE`.
+4. Create a `.env` file in the project root:
+   ```
+   SNOWFLAKE_ACCOUNT=...
+   SNOWFLAKE_USER=...
+   SNOWFLAKE_PASSWORD=...
+   ```
+5. Run `astro dev start`, open the Airflow UI, and add a Snowflake connection with ID `snowflake_default` (account, warehouse, database `FRAUD_DETECTION_DB`).
+6. Trigger the `fraud_pipeline` DAG.
+7. Run the Dynamic Table, Snowpark scoring and `FRAUD_SUMMARY` view SQL in Snowflake after the DAG completes.
+
+## Future work
+
+Power BI dashboard on `REPORTING.FRAUD_SUMMARY`, GitHub Actions CI running `dbt build` on pull requests, alerting when a batch's fraud rate crosses a threshold, and a PySpark version of the cleaning step for the full 1.3M-row dataset.
+
