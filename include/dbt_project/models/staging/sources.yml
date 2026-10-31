@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: raw
+    database: FRAUD_DETECTION_DB
+    schema: RAW
+    tables:
+      - name: transactions
+        description: Clean transactions loaded from clean_transactions.csv
+      - name: transactions_quarantine
+        description: Rows the Python cleaning step rejected (missing amount, customer_id or date)

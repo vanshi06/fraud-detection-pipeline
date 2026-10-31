@@ -1,0 +1,33 @@
+models:
+  - name: dim_customer
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+
+  - name: dim_merchant
+    columns:
+      - name: merchant_key
+        data_tests: [unique, not_null]
+
+  - name: fct_transactions
+    columns:
+      - name: transaction_id
+        data_tests: [unique, not_null]
+      - name: customer_id
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_customer')
+                field: customer_id
+      - name: merchant_key
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_merchant')
+                field: merchant_key
+
+  - name: txn_rolling_features
+    description: Dynamic Table with per-transaction rolling 24h activity and prior-spend baseline.
+    columns:
+      - name: transaction_id
+        data_tests: [unique, not_null]
