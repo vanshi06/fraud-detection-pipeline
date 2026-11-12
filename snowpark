@@ -1,0 +1,23 @@
+from snowflake.snowpark.functions import col, call_function, iff, lit
+from snowflake.snowpark.context import get_active_session
+
+DISTANCE_KM_LIMIT = 120
+SPEND_RATIO_LIMIT = 5
+
+session = get_active_session()
+
+txns = session.table("FRAUD_DETECTION_DB.CORE.FCT_TRANSACTIONS")
+stats = session.table("FRAUD_DETECTION_DB.CORE.CUSTOMER_ROLLING_STATS")
+stats = stats.select("CUSTOMER_ID", "AVG_SPEND")
+
+df = txns.join(stats, "CUSTOMER_ID", "left")
+
+df = df.with_column("DISTANCE_KM", call_function("HAVERSINE", col("CUSTOMER_LAT"), col("CUSTOMER_LONG"), col("MERCHANT_LAT"), col("MERCHANT_LONG")))
+df = df.with_column("AMOUNT_VS_AVG_RATIO", col("AMOUNT") / col("AVG_SPEND"))
+df = df.with_column("DISTANCE_FLAG", iff(col("DISTANCE_KM") > DISTANCE_KM_LIMIT, lit(1), lit(0)))
+df = df.with_column("SPEND_FLAG", iff(col("AMOUNT_VS_AVG_RATIO") > SPEND_RATIO_LIMIT, lit(1), lit(0)))
+df = df.with_column("FRAUD_RISK_SCORE", col("DISTANCE_FLAG") + col("SPEND_FLAG"))
+
+df.write.save_as_table("FRAUD_DETECTION_DB.REPORTING.FRAUD_SCORES", mode="overwrite")
+
+df.group_by("FRAUD_RISK_SCORE").count().sort("FRAUD_RISK_SCORE").show()
